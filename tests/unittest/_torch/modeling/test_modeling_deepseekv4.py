@@ -48,8 +48,11 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4Gate,
     DeepseekV4MTP,
     DeepseekV4WeightLoader,
+    _checkpoint_tensor_signature,
     _copy_deepseek_v4_fused_a_weight_scale,
+    _deepseek_v4_mtp_tensor_signatures,
     _deepseek_v4_pos_embd_params,
+    _diff_deepseek_v4_mtp_signatures,
     _normalize_deepseek_v4_nvfp4_mixed_precision_config,
     _remap_deepseek_v4_checkpoint_keys,
     _resolve_enable_fused_hc,
@@ -1858,3 +1861,181 @@ def test_fused_rope_context_positions(num_heads: int, cached_offset: int) -> Non
     )
     reference = _reference(q, cos_sin, positions.long(), num_heads)
     _assert_matches(quant_q, q_pe, reference, num_heads)
+
+
+# --- Replacement MTP heads (speculative_model) for DeepSeek-V4 -------------------
+
+
+def _mtp_head_loader_stub(num_hidden_layers: int = 1):
+    """A model with one decoder layer and one MTP layer, each owning ``foo.weight``."""
+    model = torch.nn.Module()
+    model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList(
+        [torch.nn.Module() for _ in range(num_hidden_layers + 1)]
+    )
+    for layer in model.model.layers:
+        layer.foo = torch.nn.Module()
+        layer.foo.weight = torch.nn.Parameter(torch.zeros(2), requires_grad=False)
+    model.config = SimpleNamespace(
+        q_lora_rank=1,
+        num_attention_heads=1,
+        qk_nope_head_dim=1,
+        v_head_dim=1,
+        kv_lora_rank=448,
+        num_hidden_layers=num_hidden_layers,
+        num_nextn_predict_layers=1,
+    )
+    model.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(
+            tp_rank=0, tp_size=1, cp_rank=0, cp_size=1, enable_attention_dp=False
+        ),
+        moe_load_balancer=None,
+    )
+    return model
+
+
+@pytest.mark.cpu_only
+def test_deepseek_v4_weight_remap_mtp_only_detects_mxfp4_scale():
+    # A separate MTP-head checkpoint has no ``layers.*`` keys; the routed-expert
+    # scale layout must be detected from the MTP layer's own experts.
+    weights = {
+        "mtp.0.ffn.experts.0.w1.weight": torch.tensor([[-1, 2], [3, -4]], dtype=torch.int8),
+        "mtp.0.ffn.experts.0.w1.scale": torch.tensor([1, 2], dtype=torch.int8),
+    }
+
+    remapped = _remap_deepseek_v4_checkpoint_keys(weights, num_hidden_layers=1, kv_lora_rank=448)
+
+    assert "model.layers.1.mlp.experts.0.w1.weight_scale" in remapped
+    assert remapped["model.layers.1.mlp.experts.0.w1.weight"].dtype == torch.uint8
+
+
+@pytest.mark.cpu_only
+def test_deepseek_v4_mtp_signature_of_lazy_slice_matches_tensor(tmp_path):
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    tensors = {
+        "mtp.0.a": torch.zeros((3, 4), dtype=torch.bfloat16),
+        "mtp.0.b": torch.zeros((5,), dtype=torch.uint8),
+        "mtp.0.c": torch.zeros((2, 2), dtype=torch.float8_e4m3fn),
+    }
+    path = tmp_path / "head.safetensors"
+    save_file(tensors, str(path))
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        for key, tensor in tensors.items():
+            assert _checkpoint_tensor_signature(f.get_slice(key)) == (
+                _checkpoint_tensor_signature(tensor)
+            )
+
+
+@pytest.mark.cpu_only
+def test_deepseek_v4_mtp_signature_diff():
+    base = _deepseek_v4_mtp_tensor_signatures(
+        {
+            "layers.0.attn_norm.weight": torch.zeros(4),
+            "mtp.0.enorm.weight": torch.zeros(4),
+            "mtp.0.ffn.experts.0.w1.weight": torch.zeros((2, 2), dtype=torch.uint8),
+            "mtp.0.head.weight": torch.zeros((8, 4)),  # dropped by the remap
+        }
+    )
+    assert set(base) == {"mtp.0.enorm.weight", "mtp.0.ffn.experts.0.w1.weight"}
+
+    same = _deepseek_v4_mtp_tensor_signatures(
+        {
+            "mtp.0.enorm.weight": torch.ones(4),
+            "mtp.0.ffn.experts.0.w1.weight": torch.ones((2, 2), dtype=torch.uint8),
+        }
+    )
+    assert _diff_deepseek_v4_mtp_signatures(base, same) == []
+
+    bad = _deepseek_v4_mtp_tensor_signatures(
+        {
+            "mtp.0.enorm.weight": torch.ones(4, dtype=torch.bfloat16),
+            "mtp.0.hnorm.weight": torch.ones(4),
+        }
+    )
+    problems = _diff_deepseek_v4_mtp_signatures(base, bad)
+    assert len(problems) == 3
+    assert "missing" in problems[0] and "mtp.0.ffn.experts.0.w1.weight" in problems[0]
+    assert "not in the target" in problems[1] and "mtp.0.hnorm.weight" in problems[1]
+    assert "mismatch" in problems[2] and "torch.bfloat16" in problems[2]
+
+
+@pytest.mark.cpu_only
+def test_deepseek_v4_load_mtp_head_weights_only_touches_mtp_layer():
+    model = _mtp_head_loader_stub(num_hidden_layers=1)
+
+    DeepseekV4WeightLoader(model).load_mtp_head_weights(
+        {"mtp.0.foo.weight": torch.tensor([3.0, 4.0])}
+    )
+
+    assert torch.equal(model.model.layers[1].foo.weight, torch.tensor([3.0, 4.0]))
+    assert torch.equal(model.model.layers[0].foo.weight, torch.zeros(2))
+
+
+@pytest.mark.cpu_only
+def test_deepseek_v4_load_mtp_head_weights_rejects_non_native_keys():
+    model = _mtp_head_loader_stub(num_hidden_layers=1)
+
+    with pytest.raises(ValueError, match="native 'mtp.0.\\*' key layout"):
+        DeepseekV4WeightLoader(model).load_mtp_head_weights(
+            {"mtp.layers.0.foo.weight": torch.tensor([3.0, 4.0])}
+        )
+    assert torch.equal(model.model.layers[1].foo.weight, torch.zeros(2))
+
+
+class _ReplacementHeadTarget:
+    """Just enough of DeepseekV4ForCausalLM for its load_*weights methods."""
+
+    weight_loader_cls = DeepseekV4WeightLoader
+
+    def __init__(self):
+        self.spec_config = SimpleNamespace(
+            uses_replacement_heads=True, speculative_model="/ckpt/mtp-head"
+        )
+
+
+@pytest.mark.cpu_only
+def test_deepseek_v4_load_draft_weights_routes_head_through_v4_loader(monkeypatch):
+    loaded = {}
+    monkeypatch.setattr(
+        DeepseekV4WeightLoader, "__init__", lambda self, model, is_draft_model=False: None
+    )
+    monkeypatch.setattr(DeepseekV4WeightLoader, "load_weights", lambda self, weights, **kw: None)
+    monkeypatch.setattr(
+        DeepseekV4WeightLoader,
+        "load_mtp_head_weights",
+        lambda self, weights: loaded.update(weights),
+    )
+    target = _ReplacementHeadTarget()
+    DeepseekV4ForCausalLM.load_weights(
+        target,
+        {
+            "embed.weight": torch.zeros((8, 4)),
+            "mtp.0.enorm.weight": torch.zeros(4),
+        },
+    )
+    assert target._target_mtp_tensor_signatures == {"mtp.0.enorm.weight": ((4,), "torch.float32")}
+
+    DeepseekV4ForCausalLM.load_draft_weights(
+        target,
+        {"mtp.0.enorm.weight": torch.ones(4), "unrelated.weight": torch.ones(1)},
+        weight_mapper=None,
+    )
+    assert set(loaded) == {"mtp.0.enorm.weight"}
+
+
+@pytest.mark.cpu_only
+def test_deepseek_v4_load_draft_weights_rejects_mismatched_head(monkeypatch):
+    monkeypatch.setattr(
+        DeepseekV4WeightLoader,
+        "load_mtp_head_weights",
+        lambda self, weights: pytest.fail("mismatched head must not be loaded"),
+    )
+    target = _ReplacementHeadTarget()
+    target._target_mtp_tensor_signatures = {"mtp.0.enorm.weight": ((4,), "torch.float32")}
+
+    with pytest.raises(ValueError, match="does not match the target checkpoint's MTP layer"):
+        DeepseekV4ForCausalLM.load_draft_weights(
+            target, {"mtp.0.enorm.weight": torch.ones(4, dtype=torch.bfloat16)}
+        )

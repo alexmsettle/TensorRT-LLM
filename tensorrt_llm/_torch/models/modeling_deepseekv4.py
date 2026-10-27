@@ -31,7 +31,7 @@
 import copy
 import math
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Tuple
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -49,6 +49,7 @@ from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -453,7 +454,11 @@ def _remap_deepseek_v4_checkpoint_keys(
         carries it but matches the main head, so we let the main head win.
     """
     mtp_layer_prefix = f"model.layers.{num_hidden_layers}"
-    routed_moe_scale_name = _get_deepseek_v4_routed_moe_scale_name(weights, "layers.")
+    # Detect the routed-expert scale layout from the decoder layers. A separate
+    # MTP-head checkpoint (``speculative_model``) ships only ``mtp.*`` keys, so
+    # fall back to the MTP layer's own experts instead of the FP8 default.
+    scale_detection_prefix = "layers." if any(k.startswith("layers.") for k in weights) else "mtp."
+    routed_moe_scale_name = _get_deepseek_v4_routed_moe_scale_name(weights, scale_detection_prefix)
 
     def _rename_layer_subkey(rest: str) -> Optional[str]:
         # rest examples: "attn_norm.weight", "ffn_norm.weight",
@@ -605,6 +610,75 @@ def _remap_deepseek_v4_checkpoint_keys(
     return out
 
 
+# Raw checkpoint keys the V4 remap intentionally drops (see the caveats in
+# ``_remap_deepseek_v4_checkpoint_keys``); excluded from replacement-head checks.
+_DEEPSEEK_V4_DROPPED_MTP_KEYS = frozenset({"mtp.0.head.weight"})
+
+_SAFETENSORS_DTYPE_NAMES = {
+    "F64": "torch.float64",
+    "F32": "torch.float32",
+    "F16": "torch.float16",
+    "BF16": "torch.bfloat16",
+    "F8_E4M3": "torch.float8_e4m3fn",
+    "F8_E5M2": "torch.float8_e5m2",
+    "F8_E8M0": "torch.float8_e8m0fnu",
+    "I64": "torch.int64",
+    "I32": "torch.int32",
+    "I16": "torch.int16",
+    "I8": "torch.int8",
+    "U8": "torch.uint8",
+    "BOOL": "torch.bool",
+}
+
+
+def _checkpoint_tensor_signature(value) -> Tuple[Tuple[int, ...], str]:
+    """Return ``(shape, dtype)`` for an eager tensor or a lazy safetensors slice."""
+    if isinstance(value, torch.Tensor):
+        return tuple(value.shape), str(value.dtype)
+    get_shape = getattr(value, "get_shape", None)
+    if get_shape is not None:
+        dtype = value.get_dtype()
+        return tuple(get_shape()), _SAFETENSORS_DTYPE_NAMES.get(dtype, str(dtype))
+    return tuple(getattr(value, "shape", ())), str(getattr(value, "dtype", None))
+
+
+def _deepseek_v4_mtp_tensor_signatures(weights) -> Dict[str, Tuple[Tuple[int, ...], str]]:
+    """Signatures of the raw ``mtp.*`` tensors a checkpoint ships."""
+    return {
+        key: _checkpoint_tensor_signature(weights[key])
+        for key in weights
+        if key.startswith("mtp.") and key not in _DEEPSEEK_V4_DROPPED_MTP_KEYS
+    }
+
+
+def _diff_deepseek_v4_mtp_signatures(base: Dict, head: Dict, max_items: int = 8) -> List[str]:
+    """Describe how a replacement MTP head differs from the target's own MTP layer.
+
+    A replacement head must provide exactly the tensors the target checkpoint's
+    MTP layer has, with the same shapes and dtypes. Anything else means the
+    head was trained or exported for a different layout/precision, and loading
+    it would either fail deep inside a module loader or silently keep some of
+    the target's original MTP weights.
+    """
+    problems = []
+    missing = sorted(base.keys() - head.keys())
+    extra = sorted(head.keys() - base.keys())
+    mismatched = sorted(k for k in base.keys() & head.keys() if base[k] != head[k])
+
+    def _fmt(keys):
+        more = f" (+{len(keys) - max_items} more)" if len(keys) > max_items else ""
+        return ", ".join(keys[:max_items]) + more
+
+    if missing:
+        problems.append(f"{len(missing)} tensor(s) missing from the head: {_fmt(missing)}")
+    if extra:
+        problems.append(f"{len(extra)} tensor(s) not in the target's MTP layer: {_fmt(extra)}")
+    if mismatched:
+        details = [f"{k}: target {base[k]} vs head {head[k]}" for k in mismatched]
+        problems.append(f"{len(mismatched)} shape/dtype mismatch(es): {_fmt(details)}")
+    return problems
+
+
 class DeepseekV4WeightLoader:
     # Subclass hook: rewrites raw checkpoint keys to the model's parameter names.
     # V4.1 renames a different set of modules and has to dequantize its block-32
@@ -617,16 +691,97 @@ class DeepseekV4WeightLoader:
         self.model_config = model.model_config
         self.is_draft_model = is_draft_model
 
-    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+    def load_weights(
+        self,
+        weights: Dict,
+        skip_modules: List[str] = [],
+        module_filter: Optional[Callable[[str], bool]] = None,
+    ):
         # Opt-in WAR (TRTLLM_PINNED_WEIGHT_STAGING=1) for drivers where
         # pageable H2D copies stall during weight loading; staging buffers
         # are freed on scope exit. See pinned_weight_staging.py.
         from tensorrt_llm._torch import pinned_weight_staging
 
+        # Only forward ``module_filter`` when it is used, so subclasses that
+        # override ``_load_weights_impl`` without it keep working.
+        kwargs = {} if module_filter is None else {"module_filter": module_filter}
         with pinned_weight_staging.staging_scope():
-            return self._load_weights_impl(weights, skip_modules=skip_modules)
+            return self._load_weights_impl(weights, skip_modules=skip_modules, **kwargs)
 
-    def _load_weights_impl(self, weights: Dict, skip_modules: List[str] = []):
+    def _is_mtp_module_name(self, name: str) -> bool:
+        """True for modules of the MTP layer(s) appended after the decoder layers."""
+        parts = name.split(".")
+        return (
+            len(parts) > 2
+            and parts[0] == "model"
+            and parts[1] == "layers"
+            and parts[2].isdigit()
+            and int(parts[2]) >= self.config.num_hidden_layers
+        )
+
+    def _synthesize_missing_defaults(
+        self, weights: Dict, module_filter: Optional[Callable[[str], bool]] = None
+    ) -> None:
+        # Synthesize defaults (with correct shape pulled from the model)
+        # for parameters the model has but the V4 checkpoint omits. We do
+        # this in one place vs scattering zero-fills through the per-
+        # module branches so the missing-key contract is auditable here.
+        #   indexer.k_norm.weight     → ones
+        #   indexer.k_norm.bias       → zeros
+        #   indexer.wk.weight         → zeros (V4 indexer's k path is
+        #                                served by compressor; wk unused)
+        _ones_suffixes = ("self_attn.indexer.k_norm.weight",)
+        _zeros_suffixes = (
+            "self_attn.indexer.k_norm.bias",
+            "self_attn.indexer.wk.weight",
+        )
+        model_params = dict(self.model.named_parameters())
+        for pname, p in model_params.items():
+            if pname in weights:
+                continue
+            if module_filter is not None and not module_filter(pname.rsplit(".", 1)[0]):
+                continue
+            if any(pname.endswith(s) for s in _ones_suffixes):
+                weights[pname] = torch.ones_like(p, device="cpu")
+            elif any(pname.endswith(s) for s in _zeros_suffixes):
+                weights[pname] = torch.zeros_like(p, device="cpu")
+
+    def load_mtp_head_weights(self, weights: Dict) -> None:
+        """Load a separate MTP-head checkpoint into the MTP layer(s) only.
+
+        ``weights`` holds raw DS-V4 ``mtp.0.*`` keys from ``speculative_model``.
+        They are remapped exactly like the embedded MTP layer of a full V4
+        checkpoint and loaded through this loader, so the MTP layer gets the
+        same fusions, flat-HC handling and quantized-expert layout as when it
+        is loaded from the target checkpoint. Every other module is skipped.
+        """
+        num_hidden_layers = self.config.num_hidden_layers
+        remapped = self.remap_checkpoint_keys(
+            weights,
+            num_hidden_layers=num_hidden_layers,
+            kv_lora_rank=self.config.kv_lora_rank,
+        )
+        mtp_prefix = f"model.layers.{num_hidden_layers}."
+        stray = sorted(k for k in remapped if not k.startswith(mtp_prefix))
+        if stray:
+            raise ValueError(
+                "Replacement MTP head for DeepSeek-V4 must use the native "
+                "'mtp.0.*' key layout; these keys do not map onto the MTP "
+                f"layer: {stray[:8]}"
+            )
+        if not remapped:
+            raise ValueError(
+                "Replacement MTP head for DeepSeek-V4 has no loadable 'mtp.0.*' tensors"
+            )
+        self._synthesize_missing_defaults(remapped, module_filter=self._is_mtp_module_name)
+        self.load_weights(remapped, module_filter=self._is_mtp_module_name)
+
+    def _load_weights_impl(
+        self,
+        weights: Dict,
+        skip_modules: List[str] = [],
+        module_filter: Optional[Callable[[str], bool]] = None,
+    ):
         # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
         # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
         # named-parameter keys before iterating modules. The detection is by
@@ -639,27 +794,7 @@ class DeepseekV4WeightLoader:
                 kv_lora_rank=self.config.kv_lora_rank,
             )
             weights = ConsumableWeightsDict.take_ownership(weights, remapped_weights)
-            # Synthesize defaults (with correct shape pulled from the model)
-            # for parameters the model has but the V4 checkpoint omits. We do
-            # this in one place vs scattering zero-fills through the per-
-            # module branches so the missing-key contract is auditable here.
-            #   indexer.k_norm.weight     → ones
-            #   indexer.k_norm.bias       → zeros
-            #   indexer.wk.weight         → zeros (V4 indexer's k path is
-            #                                served by compressor; wk unused)
-            _ones_suffixes = ("self_attn.indexer.k_norm.weight",)
-            _zeros_suffixes = (
-                "self_attn.indexer.k_norm.bias",
-                "self_attn.indexer.wk.weight",
-            )
-            model_params = dict(self.model.named_parameters())
-            for pname, p in model_params.items():
-                if pname in weights:
-                    continue
-                if any(pname.endswith(s) for s in _ones_suffixes):
-                    weights[pname] = torch.ones_like(p, device="cpu")
-                elif any(pname.endswith(s) for s in _zeros_suffixes):
-                    weights[pname] = torch.zeros_like(p, device="cpu")
+            self._synthesize_missing_defaults(weights, module_filter=module_filter)
 
         def requantize_weight_with_new_scale(
             weight, weight_scale, old_scale_2, new_scale_2, device
@@ -932,6 +1067,8 @@ class DeepseekV4WeightLoader:
 
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
             if name.startswith("draft_model"):
+                continue
+            if module_filter is not None and not module_filter(name):
                 continue
             if name.endswith("experts.backend"):
                 # Bound the resident file cache at one MoE layer instead of
@@ -3111,8 +3248,73 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
         )
 
     def load_weights(self, weights: Dict):
+        from ..speculative.utils import uses_mtp_head_checkpoint
+
+        if uses_mtp_head_checkpoint(self.spec_config):
+            # Remember the target's own MTP tensors so the replacement head
+            # loaded by ``load_draft_weights`` can be checked against them.
+            self._target_mtp_tensor_signatures = _deepseek_v4_mtp_tensor_signatures(weights)
         weight_loader = self.weight_loader_cls(self)
         weight_loader.load_weights(weights)
+
+    def load_draft_weights(self, weights: Dict, weight_mapper=None):
+        """Load replacement MTP heads (``speculative_model``) for DeepSeek-V4.
+
+        The generic one-engine path re-homes preprocessed ``model.layers.{N}``
+        keys onto ``draft_model.mtp_layers`` through a ``weight_mapper``. V4
+        loads its MTP layer with ``DeepseekV4WeightLoader`` instead (native
+        ``mtp.0.*`` keys, fused compressor projections, flat HC weights, packed
+        MXFP4 experts), and its generic HF mapper has no ``preprocess_weights``
+        -- so the generic path failed with ``'NoneType' object has no attribute
+        'items'``. Route the head through the V4 loader, restricted to the MTP
+        layer, after checking it matches the target's MTP layer exactly.
+        """
+        from ..speculative.utils import select_mtp_checkpoint_weights, uses_mtp_head_checkpoint
+
+        if not uses_mtp_head_checkpoint(self.spec_config):
+            return super().load_draft_weights(weights, weight_mapper)
+        if type(self).weight_loader_cls is not DeepseekV4WeightLoader:
+            raise NotImplementedError(
+                f"Replacement MTP heads (speculative_model) are not supported for "
+                f"{type(self).__name__}; only DeepSeek-V4 checkpoints are handled."
+            )
+
+        head_weights = select_mtp_checkpoint_weights(weights)
+        if not head_weights:
+            raise ValueError(
+                "speculative_model was set for MTP but no 'mtp.*' weights were "
+                f"found in {self.spec_config.speculative_model!r}. Expected "
+                "DeepSeek-V4 keys like 'mtp.0.*'."
+            )
+        n_dropped = len(weights) - len(head_weights)
+        if n_dropped:
+            logger.warning(
+                f"Ignoring {n_dropped} non-mtp tensors from speculative_model "
+                f"while loading DeepSeek-V4 MTP heads (kept {len(head_weights)})."
+            )
+
+        target_signatures = getattr(self, "_target_mtp_tensor_signatures", None)
+        if target_signatures:
+            problems = _diff_deepseek_v4_mtp_signatures(
+                target_signatures, _deepseek_v4_mtp_tensor_signatures(head_weights)
+            )
+            if problems:
+                raise ValueError(
+                    "Replacement MTP head "
+                    f"{self.spec_config.speculative_model!r} does not match the "
+                    "target checkpoint's MTP layer:\n  - " + "\n  - ".join(problems)
+                )
+        else:
+            logger.warning(
+                "Target checkpoint has no raw DeepSeek-V4 'mtp.*' tensors to "
+                "compare against; loading the replacement MTP head unverified."
+            )
+
+        self.weight_loader_cls(self).load_mtp_head_weights(head_weights)
+        logger.info(
+            f"Loaded {len(head_weights)} replacement MTP head tensors from "
+            f"{self.spec_config.speculative_model!r} into the DeepSeek-V4 MTP layer."
+        )
 
     def _post_load_decoder_layers(self) -> nn.ModuleList:
         return self.model.layers[: self.config.num_hidden_layers]
