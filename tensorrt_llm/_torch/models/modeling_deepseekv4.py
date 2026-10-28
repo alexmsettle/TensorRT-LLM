@@ -3250,12 +3250,27 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
     def load_weights(self, weights: Dict):
         from ..speculative.utils import uses_mtp_head_checkpoint
 
-        if uses_mtp_head_checkpoint(self.spec_config):
-            # Remember the target's own MTP tensors so the replacement head
-            # loaded by ``load_draft_weights`` can be checked against them.
-            self._target_mtp_tensor_signatures = _deepseek_v4_mtp_tensor_signatures(weights)
         weight_loader = self.weight_loader_cls(self)
-        weight_loader.load_weights(weights)
+        if not uses_mtp_head_checkpoint(self.spec_config):
+            weight_loader.load_weights(weights)
+            return
+        if type(self).weight_loader_cls is not DeepseekV4WeightLoader:
+            raise NotImplementedError(
+                f"Replacement MTP heads (speculative_model) are not supported for "
+                f"{type(self).__name__}; only DeepSeek-V4 checkpoints are handled."
+            )
+        # Remember the target's own MTP tensors so the replacement head loaded
+        # by ``load_draft_weights`` can be checked against them, then leave the
+        # MTP layer to that second pass: its modules are built in the
+        # replacement heads' quantization scope, which may differ from the
+        # target's, so the target's MTP tensors must not be loaded into them.
+        from ..speculative.utils import filter_mtp_checkpoint_weights
+
+        self._target_mtp_tensor_signatures = _deepseek_v4_mtp_tensor_signatures(weights)
+        weights = filter_mtp_checkpoint_weights(weights)
+        weight_loader.load_weights(
+            weights, module_filter=lambda name: not weight_loader._is_mtp_module_name(name)
+        )
 
     def load_draft_weights(self, weights: Dict, weight_mapper=None):
         """Load replacement MTP heads (``speculative_model``) for DeepSeek-V4.

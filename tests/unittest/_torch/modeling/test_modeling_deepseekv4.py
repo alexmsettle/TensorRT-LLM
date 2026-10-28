@@ -1997,11 +1997,15 @@ class _ReplacementHeadTarget:
 
 @pytest.mark.cpu_only
 def test_deepseek_v4_load_draft_weights_routes_head_through_v4_loader(monkeypatch):
-    loaded = {}
+    loaded, target_pass = {}, {}
     monkeypatch.setattr(
         DeepseekV4WeightLoader, "__init__", lambda self, model, is_draft_model=False: None
     )
-    monkeypatch.setattr(DeepseekV4WeightLoader, "load_weights", lambda self, weights, **kw: None)
+    monkeypatch.setattr(
+        DeepseekV4WeightLoader,
+        "load_weights",
+        lambda self, weights, **kw: target_pass.update(weights=dict(weights), **kw),
+    )
     monkeypatch.setattr(
         DeepseekV4WeightLoader,
         "load_mtp_head_weights",
@@ -2016,6 +2020,10 @@ def test_deepseek_v4_load_draft_weights_routes_head_through_v4_loader(monkeypatc
         },
     )
     assert target._target_mtp_tensor_signatures == {"mtp.0.enorm.weight": ((4,), "torch.float32")}
+    # The target pass must neither see the target's mtp.* tensors nor walk the
+    # MTP layer: those modules belong to the replacement heads.
+    assert set(target_pass["weights"]) == {"embed.weight"}
+    assert target_pass["module_filter"] is not None
 
     DeepseekV4ForCausalLM.load_draft_weights(
         target,
@@ -2023,6 +2031,42 @@ def test_deepseek_v4_load_draft_weights_routes_head_through_v4_loader(monkeypatc
         weight_mapper=None,
     )
     assert set(loaded) == {"mtp.0.enorm.weight"}
+
+
+class _ReplacementHeadModel(torch.nn.Module):
+    """Stub DeepseekV4ForCausalLM: one decoder layer + one MTP layer, real V4 loader."""
+
+    weight_loader_cls = DeepseekV4WeightLoader
+
+    def __init__(self):
+        super().__init__()
+        stub = _mtp_head_loader_stub(num_hidden_layers=1)
+        self.model = stub.model
+        self.config = stub.config
+        self.model_config = stub.model_config
+        self.spec_config = SimpleNamespace(
+            uses_replacement_heads=True, speculative_model="/ckpt/mtp-head"
+        )
+
+
+@pytest.mark.cpu_only
+def test_deepseek_v4_replacement_head_end_to_end_with_real_loader():
+    model = _ReplacementHeadModel()
+
+    DeepseekV4ForCausalLM.load_weights(
+        model,
+        {
+            "layers.0.foo.weight": torch.tensor([1.0, 2.0]),
+            "mtp.0.foo.weight": torch.tensor([9.0, 9.0]),
+        },
+    )
+    assert torch.equal(model.model.layers[0].foo.weight, torch.tensor([1.0, 2.0]))
+    # The target's own MTP tensors are not loaded when heads are replaced.
+    assert torch.equal(model.model.layers[1].foo.weight, torch.zeros(2))
+
+    DeepseekV4ForCausalLM.load_draft_weights(model, {"mtp.0.foo.weight": torch.tensor([5.0, 6.0])})
+    assert torch.equal(model.model.layers[1].foo.weight, torch.tensor([5.0, 6.0]))
+    assert torch.equal(model.model.layers[0].foo.weight, torch.tensor([1.0, 2.0]))
 
 
 @pytest.mark.cpu_only

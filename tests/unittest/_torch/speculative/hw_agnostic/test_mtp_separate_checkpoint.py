@@ -988,3 +988,38 @@ def test_replacement_loader_initializes_independent_architecture_mapper(monkeypa
     assert captured["model"] is model.draft_model
     assert "mtp_layers.0.layers.0.enorm.weight" in captured["weights"]
     assert captured["allow_partial_loading"] is False
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "head_quantization, expected",
+    [
+        ({"quant_method": "fp8", "weight_block_size": [128, 128]}, True),
+        ({"quant_method": "fp8", "weight_block_size": [64, 64]}, False),
+        (None, False),
+    ],
+)
+def test_replacement_head_uses_target_native_quantization(tmp_path, head_quantization, expected):
+    """Heads exported in the target's own format reuse the target's quantization."""
+    head_config = {"architectures": ["DeepseekV4ForCausalLM"]}
+    if head_quantization is not None:
+        head_config["quantization_config"] = head_quantization
+    (tmp_path / "config.json").write_text(json.dumps(head_config))
+    target = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            quantization_config={"quant_method": "fp8", "weight_block_size": [128, 128]}
+        )
+    )
+
+    assert (
+        modeling_speculative._replacement_head_uses_target_quantization(str(tmp_path), target)
+        is expected
+    )
+
+
+@pytest.mark.cpu_only
+def test_replacement_head_target_quantization_requires_config(tmp_path):
+    target = SimpleNamespace(pretrained_config=SimpleNamespace(quantization_config={"a": 1}))
+    assert not modeling_speculative._replacement_head_uses_target_quantization(
+        str(tmp_path), target
+    )

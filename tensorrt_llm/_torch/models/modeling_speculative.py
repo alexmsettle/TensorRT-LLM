@@ -3,6 +3,7 @@
 #
 import copy
 import inspect
+import json
 import os
 from dataclasses import replace
 from typing import Dict, Generic, Iterator, List, Optional, Tuple
@@ -72,12 +73,52 @@ def _set_draft_kv_cache_quant_algo(draft_config: ModelConfig,
             layer_quant_config.kv_cache_quant_algo = algo
 
 
+def _quantization_config_as_dict(quantization_config) -> Optional[dict]:
+    if quantization_config is None or isinstance(quantization_config, dict):
+        return quantization_config
+    to_dict = getattr(quantization_config, "to_dict", None)
+    return to_dict() if callable(to_dict) else dict(vars(quantization_config))
+
+
+def _replacement_head_uses_target_quantization(
+        checkpoint_dir: str, model_config: ModelConfig) -> bool:
+    """True when replacement MTP heads ship the target's native quantization.
+
+    A head exported in the target checkpoint's own format (e.g. DeepSeek-V4's
+    FP8 block-scaled weights with MXFP4 routed experts) carries no ModelOpt
+    ``hf_quant_config.json``; its ``config.json`` declares the same
+    ``quantization_config`` as the target. Such heads must be built with the
+    target's quantization, exactly like the embedded MTP layers they replace.
+    """
+    config_path = os.path.join(checkpoint_dir, "config.json")
+    if not os.path.isfile(config_path):
+        return False
+    try:
+        with open(config_path) as f:
+            head_quantization = json.load(f).get("quantization_config")
+    except (OSError, ValueError):
+        return False
+    target_quantization = _quantization_config_as_dict(
+        getattr(model_config.pretrained_config, "quantization_config", None))
+    return bool(head_quantization) and head_quantization == target_quantization
+
+
 def _replacement_mtp_model_config(model_config: ModelConfig) -> ModelConfig:
     """Build an independent quantization scope for replacement MTP weights."""
     from .checkpoints.auto_mapper import AutoCheckpointMapper
 
     checkpoint_dir = str(model_config.spec_config.speculative_model)
     quant_path = os.path.join(checkpoint_dir, "hf_quant_config.json")
+    if (not os.path.isfile(quant_path)
+            and _replacement_head_uses_target_quantization(
+                checkpoint_dir, model_config)):
+        logger.info(
+            "Replacement MTP heads in %s use the target checkpoint's native "
+            "quantization_config; building them with the target's "
+            "quantization.", checkpoint_dir)
+        draft_config = replace(model_config, skip_create_weights_in_init=True)
+        draft_config.extra_attrs = model_config.extra_attrs
+        return draft_config
     quant_config, layer_configs = QuantConfig(), None
     if os.path.isfile(quant_path):
         quant_config, layer_configs = ModelConfig.load_modelopt_quant_config(
